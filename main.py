@@ -6,14 +6,18 @@ from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
 from dotenv import load_dotenv
 import os
-import glob
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Set environment variables
-os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
-os.environ["PINECONE_API_KEY"] = os.getenv('PINECONE_API_KEY')
+# Validate required environment variables
+openai_api_key = os.getenv("OPENAI_API_KEY")
+pinecone_api_key = os.getenv("PINECONE_API_KEY")
+
+if not openai_api_key or not pinecone_api_key:
+    raise EnvironmentError(
+        "OPENAI_API_KEY and PINECONE_API_KEY must be provided in the environment"
+    )
 
 def main():
     # Load documents from local directory
