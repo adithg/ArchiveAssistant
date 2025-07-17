@@ -1,0 +1,8 @@
+langchain-community
+langchain-pinecone
+langchain-openai
+unstructured
+langchain-text-splitters
+python-dotenv
+
+pip install -r requirements.txt
