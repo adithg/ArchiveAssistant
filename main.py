@@ -1,76 +1,236 @@
 from langchain_pinecone import PineconeVectorStore
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.document_loaders import DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI
 from langchain.chains import RetrievalQA
+from langchain.schema import Document
 from dotenv import load_dotenv
 import os
+import glob
+import nltk
+import ssl
+from pinecone import Pinecone
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Validate required environment variables
-openai_api_key = os.getenv("OPENAI_API_KEY")
-pinecone_api_key = os.getenv("PINECONE_API_KEY")
+# Set environment variables
+os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+os.environ["PINECONE_API_KEY"] = os.getenv('PINECONE_API_KEY')
 
-if not openai_api_key or not pinecone_api_key:
-    raise EnvironmentError(
-        "OPENAI_API_KEY and PINECONE_API_KEY must be provided in the environment"
-    )
+def setup_nltk():
+    try:
+        # Try to create unverified HTTPS context to handle SSL issues
+        try:
+            _create_unverified_https_context = ssl._create_unverified_context
+        except AttributeError:
+            pass
+        else:
+            ssl._create_default_https_context = _create_unverified_https_context
+        
+        # Download required NLTK data
+        nltk.download('punkt_tab', quiet=True)
+        nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+        print("NLTK data downloaded successfully")
+    except Exception as e:
+        print(f"Warning: Could not download NLTK data: {e}")
 
-def main():
+def load_text_files(directory):
+    """Load text files from directory and extract metadata from filenames"""
+    documents = []
+    txt_files = glob.glob(os.path.join(directory, "*.txt"))
+    
+    for file_path in txt_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+                # Extract teaching name from filename
+                filename = os.path.basename(file_path)
+                teaching_name = filename.replace('.txt', '')
+                
+                # Create a Document object with enhanced metadata
+                doc = Document(
+                    page_content=content,
+                    metadata={
+                        "source": file_path,
+                        "teaching_name": teaching_name,
+                        "filename": filename
+                    }
+                )
+                documents.append(doc)
+                print(f"Loaded: {teaching_name}")
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+    
+    return documents
+
+def check_index_exists_and_has_data(index_name):
+    """Check if Pinecone index exists and has data"""
+    try:
+        pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+        
+        # Check if index exists
+        if index_name not in pc.list_indexes().names():
+            print(f"Index '{index_name}' does not exist.")
+            return False
+        
+        # Check if index has data
+        index = pc.Index(index_name)
+        stats = index.describe_index_stats()
+        vector_count = stats.get('total_vector_count', 0)
+        
+        print(f"Index '{index_name}' exists with {vector_count} vectors.")
+        return vector_count > 0
+        
+    except Exception as e:
+        print(f"Error checking index: {e}")
+        return False
+
+def get_user_choice(prompt, valid_choices):
+    """Get user input with validation"""
+    while True:
+        choice = input(prompt).strip().lower()
+        if choice in valid_choices:
+            return choice
+        print(f"Please enter one of: {', '.join(valid_choices)}")
+
+def upload_documents(index_name, embeddings):
+    """Upload documents to Pinecone"""
     # Load documents from local directory
-    loader = DirectoryLoader('HenryTranscripts', glob="*.txt")
-    docs = loader.load()
+    docs = load_text_files('HenryTranscripts')
+    
+    if not docs:
+        print("No documents loaded. Please check your HenryTranscripts directory.")
+        return None
     
     print(f"Loaded {len(docs)} documents")
     
-    # Create embeddings
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small"
-    )
-    
     # Set up text splitter
-    index_name = "archiveassistantlarge"
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     split_docs = text_splitter.split_documents(docs)
     
     print(f"Split into {len(split_docs)} chunks")
     
-    # Create vector store
+    # Create vector store and upload documents
+    print("Creating vector store and uploading documents...")
     vectorstore = PineconeVectorStore.from_documents(
         split_docs, 
         embeddings, 
         index_name=index_name
     )
+    print("Documents uploaded successfully!")
+    return vectorstore
+
+def main():
+    setup_nltk()
     
-    # Set up the QA chain
+    index_name = "achiveassistantlarge"
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    
+    # Check if we need to upload documents
+    has_existing_data = check_index_exists_and_has_data(index_name)
+    
+    if has_existing_data:
+        print("Found existing data in Pinecone.")
+        choice = get_user_choice(
+            "Do you want to:\n"
+            "1. Use existing data (u)\n"
+            "2. Re-upload documents (r)\n"
+            "3. Quit (q)\n"
+            "Enter your choice: ", 
+            ['u', 'r', 'q', 'use', 'reupload', 'quit']
+        )
+        
+        if choice in ['q', 'quit']:
+            print("Goodbye!")
+            return
+        elif choice in ['r', 'reupload']:
+            print("Re-uploading documents...")
+            vectorstore = upload_documents(index_name, embeddings)
+            if vectorstore is None:
+                return
+        else:  # use existing
+            print("Using existing data.")
+            vectorstore = PineconeVectorStore(
+                index_name=index_name,
+                embedding=embeddings
+            )
+    else:
+        print("No existing data found.")
+        choice = get_user_choice(
+            "Do you want to upload documents now? (y/n): ",
+            ['y', 'n', 'yes', 'no']
+        )
+        
+        if choice in ['n', 'no']:
+            print("Cannot proceed without documents. Goodbye!")
+            return
+        
+        print("Loading and processing documents...")
+        vectorstore = upload_documents(index_name, embeddings)
+        if vectorstore is None:
+            return
+    
+    # Set up the QA chain with specific instructions for Henry quotes
     llm = ChatOpenAI(
         temperature=0,
         model_name="gpt-3.5-turbo"
     )
     
+    # Custom prompt to ensure only Henry's direct quotes are returned
+    from langchain.prompts import PromptTemplate
+    
+    prompt_template = """You are an assistant that helps people find direct quotes from Henry's teachings. 
+
+IMPORTANT INSTRUCTIONS:
+1. ONLY provide direct quotes from Henry - never paraphrase or summarize
+2. Always include the exact timestamp if available in the source material
+3. Always include the name/title of the specific teaching the quote comes from
+4. If you cannot find a direct quote that answers the question, say "I could not find a direct quote from Henry addressing this topic."
+5. Never add your own commentary or interpretation - only Henry's exact words
+
+Use this context to find direct quotes from Henry:
+{context}
+
+Question: {question}
+
+Response format:
+Teaching: [Name of the teaching]
+Timestamp: [Exact timestamp if available]
+Henry's Quote: "[Exact quote from Henry]"
+
+If multiple relevant quotes exist, provide them in the same format, separated by line breaks.
+
+Answer:"""
+    
+    PROMPT = PromptTemplate(
+        template=prompt_template,
+        input_variables=["context", "question"]
+    )
+    
     qa_chain = RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
-        retriever=vectorstore.as_retriever()
+        retriever=vectorstore.as_retriever(),
+        chain_type_kwargs={"prompt": PROMPT}
     )
     
     # Interactive query loop
-    print("\nVector store created successfully!")
-    print("You can now ask questions about the documents.")
+    print("\nReady to find Henry's direct quotes!")
+    print("Ask questions and I'll provide his exact words with timestamps and teaching names.")
     print("Type 'quit' to exit.\n")
     
     while True:
-        query = input("Enter your question: ")
+        query = input("What would you like to find from Henry's teachings? ")
         
         if query.lower() == 'quit':
             break
             
         try:
             result = qa_chain.invoke(query)
-            print(f"\nAnswer: {result['result']}\n")
+            print(f"\n{result['result']}\n")
+            print("-" * 50)
         except Exception as e:
             print(f"Error: {e}\n")
 
